@@ -1,0 +1,65 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  labels:
+    prometheus: harvester
+    role: alert-rules
+  name: prometheus-harvester-vm-memory-rules
+  namespace: {{ .Release.Namespace }}
+spec:
+  groups:
+  - name: harvester-vm-memory.recordingRules
+    rules:
+    # Headroom between the virt-launcher compute container's memory limit and its working set.
+    # This is the margin the memory cgroup OOM killer sees. The upstream KubeVirt rule
+    # kubevirt_vm_container_memory_request_margin_based_on_working_set_bytes is based on the
+    # request, which Harvester sets below the limit (memory overcommit), so it cannot predict OOM kills.
+    - record: harvester_vm_memory_limit_margin_bytes
+      expr: |-
+        (
+          kube_pod_container_resource_limits{container="compute", resource="memory", pod=~"virt-launcher-.*"}
+          - on (namespace, pod) group_left
+          max by (namespace, pod) (container_memory_working_set_bytes{container="compute", pod=~"virt-launcher-.*"})
+        )
+        * on (namespace, pod) group_left (name)
+        max by (namespace, pod, name) (label_replace(kubevirt_vmi_info{phase="running"}, "pod", "$1", "vmi_pod", "(.+)"))
+  - name: harvester-vm-memory.alerts
+    rules:
+    - alert: HarvesterVMMemoryLimitMarginLow
+      annotations:
+        summary: VM {{`{{ $labels.name }}`}} is close to its memory limit
+        description: >-
+          The virt-launcher compute container for VM {{`{{ $labels.namespace }}`}}/{{`{{ $labels.name }}`}} has
+          {{`{{ $value | humanize1024 }}`}}B of headroom between its working set and its memory limit
+          for more than 10 minutes. If usage grows past the limit the VM is OOM-killed by the host.
+          Raise additional-guest-memory-overhead-ratio or set Reserved Memory on the VM.
+      expr: harvester_vm_memory_limit_margin_bytes < 256 * 1024 * 1024
+      for: 10m
+      labels:
+        severity: warning
+    - alert: HarvesterVMMemoryLimitMarginCritical
+      annotations:
+        summary: VM {{`{{ $labels.name }}`}} is about to exceed its memory limit
+        description: >-
+          The virt-launcher compute container for VM {{`{{ $labels.namespace }}`}}/{{`{{ $labels.name }}`}} has only
+          {{`{{ $value | humanize1024 }}`}}B of headroom between its working set and its memory limit.
+          The VM will be OOM-killed by the host if usage grows further.
+      expr: harvester_vm_memory_limit_margin_bytes < 128 * 1024 * 1024
+      for: 5m
+      labels:
+        severity: critical
+    - alert: HarvesterVMOOMKilled
+      annotations:
+        summary: VM {{`{{ $labels.name }}`}} was OOM-killed by the host
+        description: >-
+          The compute container of VM {{`{{ $labels.namespace }}`}}/{{`{{ $labels.name }}`}} recorded an OOM event.
+          The guest was reset without a clean shutdown. See
+          https://harvesterhci.io/kb/how_harvester_eliminates_vm_oom_killers.
+      expr: |-
+        (
+          increase(container_oom_events_total{container="compute", pod=~"virt-launcher-.*"}[10m])
+          * on (namespace, pod) group_left (name)
+          max by (namespace, pod, name) (label_replace(kubevirt_vmi_info, "pod", "$1", "vmi_pod", "(.+)"))
+        ) > 0
+      labels:
+        severity: critical
